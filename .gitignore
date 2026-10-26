@@ -1,0 +1,40 @@
+# Python bytecode and package/build outputs
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments and local environment files
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Test, lint, and type-check caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Local data and model artifacts
+data/
+artifacts/
+mlruns/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
