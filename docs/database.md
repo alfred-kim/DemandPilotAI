@@ -93,19 +93,44 @@ This is the accepted checksum-level reference instead of copying large raw CSV r
 
 Index: `(business_id, source_name, file_name)`; files are not updated in place. A changed hash creates a new row.
 
-### `ingestion_batches` — one logical import attempt
+### `ingestion_imports` — one logical import request
 
 - `id uuid PRIMARY KEY`, `business_id uuid NOT NULL REFERENCES businesses(id)`
-- `source_name text NOT NULL`, `idempotency_key text NOT NULL` — stable content/config key for the logical import
+- `source_name text NOT NULL`, `idempotency_key text NOT NULL` — stable key derived from the source content and relevant import configuration
+- `created_at timestamptz NOT NULL`, `updated_at timestamptz NOT NULL`
+- `UNIQUE (business_id, id)`
+- `UNIQUE (business_id, source_name, idempotency_key)`
+
+This table identifies one logical import request. A changed source checksum or relevant import configuration must produce a new idempotency key.
+
+### `ingestion_batches` — one execution attempt
+
+- `id uuid PRIMARY KEY`, `business_id uuid NOT NULL`, `import_id uuid NOT NULL`
+- `attempt_number integer NOT NULL CHECK (attempt_number >= 1)`
+- `retry_of_batch_id uuid NULL` — references the previous failed attempt for an explicit retry
 - `status text NOT NULL CHECK (status IN ('RUNNING','SUCCEEDED','PARTIAL','FAILED'))`
 - `started_at timestamptz NOT NULL`, `finished_at timestamptz NULL`
-- `rows_read bigint NOT NULL DEFAULT 0 CHECK (rows_read >= 0)`, `rows_loaded bigint NOT NULL DEFAULT 0 CHECK (rows_loaded >= 0)`, `rows_quarantined bigint NOT NULL DEFAULT 0 CHECK (rows_quarantined >= 0)`, `duplicate_rows bigint NOT NULL DEFAULT 0 CHECK (duplicate_rows >= 0)`
-- `error_code text NULL`, `error_message text NULL` — sanitized, no credentials
+- `rows_read bigint NOT NULL DEFAULT 0 CHECK (rows_read >= 0)`, `rows_loaded bigint NOT NULL DEFAULT 0 CHECK (rows_loaded >= 0)`, `rows_quarantined bigint NOT NULL DEFAULT 0 CHECK (rows_quarantined >= 0)`
+- `error_code text NULL`, `error_message text NULL` — sanitized; must not contain credentials or secrets
+- `lease_owner text NULL`, `lease_expires_at timestamptz NULL` — support recovery of interrupted attempts
+- `lease_generation bigint NOT NULL DEFAULT 0 CHECK (lease_generation >= 0)` — fencing token generation to prevent an expired worker from committing after a takeover
 - `created_at timestamptz NOT NULL`, `updated_at timestamptz NOT NULL`
-- `UNIQUE (business_id, id)`, `UNIQUE (business_id, source_name, idempotency_key)`
-- Check: `finished_at IS NULL OR finished_at >= started_at`; terminal status iff `finished_at IS NOT NULL`.
+- `UNIQUE (business_id, id)`
+- `UNIQUE (business_id, import_id, attempt_number)`
+- Composite foreign key `(business_id, import_id)` references `ingestion_imports(business_id, id)`
+- Composite self-reference `(business_id, retry_of_batch_id)` references `ingestion_batches(business_id, id)`
+- Retry validation: when `retry_of_batch_id` is not NULL, the referenced batch must belong to the same `business_id` and `import_id`, have a lower `attempt_number`, and have status `FAILED`. Enforce this through a database trigger or equivalent transaction-safe mechanism.
+- Retry history integrity: batches referenced by another batch through `retry_of_batch_id` must not be deleted, and their `FAILED` status must not be changed. Database enforcement must serialize retry creation against updates or deletion of the referenced batch to prevent concurrent transactions from violating these rules.
+- Retry-chain integrity: each retry must reference the immediately preceding failed attempt for the same logical import. Enforce this in the database, not solely in application code.
+- Check: `finished_at IS NULL OR finished_at >= started_at`
+- Check: terminal status (`SUCCEEDED`, `PARTIAL`, or `FAILED`) requires `finished_at IS NOT NULL`; `RUNNING` requires `finished_at IS NULL`
 
-Index: `(business_id, status, started_at DESC)`.
+Indexes:
+
+- `(business_id, status, started_at DESC)`
+- `(business_id, import_id, attempt_number DESC)`
+- Partial unique index on `(business_id, import_id)` where `status = 'RUNNING'`, ensuring at most one running attempt per logical import.
+
 
 ### `ingestion_batch_files` — batch inputs
 
@@ -194,6 +219,14 @@ Indexes: `(business_id, occurred_at DESC)`, `(business_id, entity_type, entity_i
 
 These are not part of the initial migration unless separately approved: `inventory_snapshots` (on-hand/inbound state at an as-of date), `inventory_movements` (receipts, sales, adjustments), `product_suppliers` (effective-dated supplier lead time, MOQ, pack multiple and cost), `feature_snapshots` (origin-scoped feature inputs and provenance), `model_runs` (training/evaluation run metadata), `model_versions` (immutable model identity and lifecycle state), `forecasts` (append-only point/interval forecasts), `forecast_actuals` (later observed outcomes linked to forecasts), `model_evaluation_metrics` (metric value, validity and sample size), `backtest_runs` (schedule/configuration and status), `recommendations` (proposed action and evidence), `recommendation_status_history` (actor and state transition), `recommendation_feedback` (manager response/reason), and `business_action_outcomes` (separately measured executed-action outcomes). Each business-owned later table will include `business_id`; forecast-related DDL requires a separate review if not included in the approved M3 schema.
 
+The following lease-state invariants must be enforced by named database constraints:
+
+- A `RUNNING` batch must have a non-empty `lease_owner` and a non-NULL `lease_expires_at`.
+- A terminal batch (`SUCCEEDED`, `PARTIAL`, or `FAILED`) must have `lease_owner IS NULL` and `lease_expires_at IS NULL`.
+- `lease_generation` must remain nonnegative and increase whenever ownership is transferred to a new worker.
+- Lease acquisition, renewal, takeover, and terminal completion must use transactions that serialize changes to the batch row. Every canonical-write transaction must validate the current generation while holding the required lock.
+- A worker must clear its lease when transitioning to a terminal status. A worker that has lost ownership must not clear or modify the current owner's lease.
+
 ## 5. Tenant isolation
 
 - Every business-owned table above includes non-null `business_id`, except `businesses`, the tenant root.
@@ -264,4 +297,83 @@ Price intervals for the same business, store, product, and source must not overl
 Audit logs are intended to be append-only. Document and test the database permissions or other enforcement mechanism that prevents ordinary application operations from updating or deleting audit records. Do not store credentials, secrets, or unnecessary sensitive information in audit payloads.
 
 ### Approval status
-**PROPOSED — NOT YET APPROVED FOR MIGRATION.** The schema requires review after these safeguards are incorporated. No migrations or application tables may be created before explicit approval of the revised schema.
+**PROPOSED — MIGRATION APPROVAL PENDING.** The safeguards are documented as requirements but have not yet been implemented or tested. Review the complete schema and approve it explicitly before creating migrations or application tables.
+## Implementation Safeguards — Detailed Proposal
+
+### 1. Null-safe sales status enforcement
+
+Use a named PostgreSQL `CHECK` constraint with an explicit branch for each permitted `data_status` value. `data_status` must be `NOT NULL`. The constraint must enforce all of the following:
+
+- `OBSERVED`: `units IS NOT NULL AND units > 0`.
+- `ZERO_CONFIRMED`: `units IS NOT NULL AND units = 0`.
+- `MISSING` and `NOT_AVAILABLE`: `units IS NULL`.
+- `IMPUTED`: `units IS NOT NULL AND units >= 0`.
+
+The existing nonnegative `units` check remains. Invalid status/value combinations must be rejected by PostgreSQL rather than relying on application validation alone.
+
+### 2. Source provenance and retention
+
+Keep original source files in a controlled, access-restricted location. Record the source name, filename, SHA-256 checksum, size, detected format, and source reference in `source_files`. Source references must not contain credentials or signed URLs that expose secrets.
+
+Do not overwrite original source files. A corrected delivery creates a new checksum reference. Correction audit events must identify the affected entity, the previous and new non-sensitive values, and the relevant old and new source-file checksums. Define and document the retention and backup policy before production use.
+
+### 3. Concurrent import idempotency and retries
+
+`ingestion_imports` stores one logical import request, uniquely identified by `(business_id, source_name, idempotency_key)`. `ingestion_batches` stores individual execution attempts for that request.
+
+Before starting an attempt, the worker must create or locate the logical import using a conflict-safe insert, then lock its `ingestion_imports` row with `SELECT ... FOR UPDATE` inside a transaction. This lock serializes decisions for concurrent requests using the same logical import key.
+
+- If an attempt is `RUNNING` with a valid lease, do not start another attempt; return an in-progress result.
+- If the latest attempt is `SUCCEEDED` or `PARTIAL`, return its completed result without repeating canonical writes.
+- If the latest attempt is `FAILED`, return its recorded failure unless an explicit retry is requested.
+- An explicit retry creates a new `ingestion_batches` row with the next `attempt_number` and `retry_of_batch_id` referencing the preceding failed attempt. Never reset a terminal attempt to `RUNNING`.
+- A partial unique index on `(business_id, import_id)` for `status = 'RUNNING'` provides an additional database safeguard against concurrent active attempts.
+- A changed source checksum or relevant import configuration must produce a new logical import key.
+
+Use the unique natural keys and transactional writes on canonical tables to prevent duplicate sales, prices, and calendar records. Retry behavior must be deterministic and safe if a client repeats the same request.
+
+
+
+### 4. Interrupted-import recovery
+
+Each execution attempt in `ingestion_batches` uses `lease_owner`, `lease_expires_at`, and `lease_generation` to coordinate work and recover interrupted processing.
+The following lease-state invariants must be enforced by named database constraints:
+
+- A `RUNNING` batch must have a non-empty `lease_owner` and a non-NULL `lease_expires_at`.
+- A terminal batch (`SUCCEEDED`, `PARTIAL`, or `FAILED`) must have `lease_owner IS NULL` and `lease_expires_at IS NULL`.
+- `lease_generation` must remain nonnegative and increase whenever ownership is transferred to a new worker.
+- Lease acquisition, renewal, takeover, and terminal completion must use transactions that serialize changes to the batch row. Every canonical-write transaction must validate the current generation while holding the required lock.
+- A worker must clear its lease when transitioning to a terminal status. A worker that has lost ownership must not clear or modify the current owner's lease.
+
+- A worker must acquire or renew its lease transactionally. Every successful takeover increments `lease_generation`.
+- A recovery worker may reclaim a `RUNNING` attempt only after its lease has expired. Reclaim must be serialized with normal worker activity so two workers cannot own the same active generation.
+- Every canonical-write transaction must verify the worker's current lease generation while holding the appropriate database lock. A stale worker whose generation has been superseded must be prevented from committing writes or completing the batch.
+- Lease expiration alone does not prove that the previous process has stopped. Fencing-token validation must therefore protect writes even if the previous worker resumes after a takeover.
+- Canonical writes and successful batch completion must be committed atomically. On failure, roll back the transaction's canonical writes and record a sanitized failure in a separate transaction.
+- Recovery must be safe to repeat. A recovered attempt must not duplicate already committed data, and a terminal attempt must not be silently restarted. If another execution is needed after a recorded failure, create a new attempt linked through `retry_of_batch_id`.
+
+Integration tests must cover concurrent requests, expired leases, worker takeover, stale-worker rejection, repeated recovery, and failure followed by retry.
+
+
+
+### 5. Concurrent price-interval protection
+
+Before inserting or correcting a price interval, acquire a transaction-level PostgreSQL advisory lock derived from the business, store, product, and source identity. Use the same deterministic lock identity for every price write to that series.
+
+While holding the lock, check for overlapping half-open intervals `[valid_from, valid_to)`. Treat a null `valid_to` as an open-ended interval. Reject and quarantine conflicting input rather than silently resolving the conflict.
+
+Perform validation and writes in the same transaction. Test overlapping and adjacent intervals, including concurrent attempts. A database exclusion constraint may be considered later, but application-only validation without serialization is not sufficient.
+
+### 6. Audit-log immutability
+
+Use separate database roles for schema migrations and ordinary application operations. The ordinary application role may insert and read audit records but must not have `UPDATE`, `DELETE`, or `TRUNCATE` privileges on `audit_logs`.
+
+Audit payloads must exclude credentials, secrets, and unnecessary sensitive data. Add integration tests proving that ordinary application permissions cannot update or delete audit rows. Administrative database owners remain privileged and must be tightly controlled.
+
+### 7. Migration approval status
+
+The schema proposal now documents the retry-attempt relationships, lease-state invariants, interrupted-import recovery, concurrent price-interval protection, and audit-log permissions required for implementation.
+
+These requirements have not yet been implemented or tested. Before migration approval, review the complete schema for consistency, translate the requirements into PostgreSQL constraints, triggers, indexes, and permissions as appropriate, and define the integration tests that will verify them.
+
+**Status: PROPOSED — migration approval remains pending. No migrations or application tables may be created before explicit approval of the revised schema.**
